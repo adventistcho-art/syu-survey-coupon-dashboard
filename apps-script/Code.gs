@@ -5,6 +5,7 @@
  * 하는 일
  *  1) 응답이 들어올 때마다 학과별 참여 인원을 집계합니다.
  *  2) 설문 선택지의 "현재 참여 학생 비율"을 갱신하고, 10%를 채운 학과는 목록에서 뺍니다.
+ *     설문 안의 "학과별 실시간 참여 현황" 그래프 이미지도 다시 그립니다.
  *  3) GitHub 대시보드가 읽어 갈 집계 JSON을 웹앱 주소(/exec)로 내보냅니다.
  *     내보내는 값은 학과명 · 참여 인원 · 쿠폰 수뿐이고, 학번 · 전화번호는 내보내지 않습니다.
  *
@@ -19,6 +20,8 @@ const CONFIG = {
   RATE: 0.1,                    // 재학생 대비 목표 비율 (10%)
   CLOSE_FULL_DEPTS: true,       // 목표를 채운 학과를 선택지에서 뺄지
   UPDATE_LABELS: true,          // 선택지 옆 "현재 참여 학생 비율"을 갱신할지
+  UPDATE_CHART: true,           // 설문 안의 참여 현황 그래프 이미지를 다시 그릴지
+  CHART_TITLE: '학과별 실시간 참여 현황', // 그래프 이미지 항목 제목 (앞부분)
 };
 
 /** 2026학년도 2학기 재학생 수 (IR 학적현황월별 2026-10-01 기준, 학적상태=재학). 학과명은 선택지 괄호 앞 이름과 같아야 합니다.
@@ -84,6 +87,7 @@ function refresh() {
     const item = findDeptItem_(form);
     const stats = computeStats_(form, item);
     if (CONFIG.UPDATE_LABELS || CONFIG.CLOSE_FULL_DEPTS) updateChoices_(item, stats);
+    if (CONFIG.UPDATE_CHART) updateChart_(form, stats);
     PropertiesService.getScriptProperties().setProperty(STATS_KEY, JSON.stringify(stats));
     return stats;
   } finally {
@@ -151,6 +155,32 @@ function updateChoices_(item, stats) {
     return typed.createChoice(label);
   });
   typed.setChoices(choices);
+}
+
+/** 학과별 참여율(%) 가로 막대그래프를 그려 설문의 이미지 항목을 교체 */
+function updateChart_(form, stats) {
+  const imageItem = form.getItems(FormApp.ItemType.IMAGE)
+    .find(it => it.getTitle().trim().indexOf(CONFIG.CHART_TITLE) === 0);
+  if (!imageItem) return;
+  const goal = CONFIG.RATE * 100;
+  const rows = stats.departments
+    .map(d => [d.name, Math.round(Math.min(goal, d.count / ENROLLMENT[d.name] * 100) * 10) / 10])
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ko'));
+  const table = Charts.newDataTable()
+    .addColumn(Charts.ColumnType.STRING, '학과')
+    .addColumn(Charts.ColumnType.NUMBER, '참여율(%)');
+  rows.forEach(r => table.addRow(r));
+  const chart = Charts.newBarChart()
+    .setDataTable(table.build())
+    .setDimensions(740, 880)
+    .setRange(0, goal)
+    .setLegendPosition(Charts.Position.NONE)
+    .setColors(['#2a78d6'])
+    .setOption('chartArea', { left: 170, top: 16, width: 540, height: 820 })
+    .setOption('vAxis', { textStyle: { fontSize: 13 } })
+    .setOption('hAxis', { textStyle: { fontSize: 12 }, ticks: [0, 2, 4, 6, 8, 10] })
+    .build();
+  imageItem.asImageItem().setImage(chart.getAs('image/png'));
 }
 
 function readStats_() {
