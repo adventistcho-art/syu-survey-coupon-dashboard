@@ -96,22 +96,13 @@
   .qr img, .qr canvas { width: 172px !important; height: 172px !important; }
   .qr-box { display: flex; flex-direction: column; align-items: center; gap: 10px; }
   .qr-caption { font-size: 12px; color: var(--ink-3); margin-top: -4px; }
-  .btn {
-    display: inline-flex; justify-content: center; align-items: center; gap: 8px;
-    width: 100%; min-height: 48px; padding: 0 20px; border-radius: 12px;
-    background: var(--accent); color: var(--accent-ink);
-    font-size: 16px; font-weight: 700; text-decoration: none;
-    transition: transform .12s ease, filter .12s ease;
-  }
-  .btn:hover { filter: brightness(1.06); }
-  .btn:active { transform: scale(.98); }
-  .btn[aria-disabled="true"] { background: var(--closed); pointer-events: none; }
 
   .ended {
     display: none; margin-top: 16px; padding: 14px 18px; border-radius: 12px;
     background: var(--surface-2); color: var(--ink); font-weight: 700; text-align: center;
   }
   body.is-ended .ended { display: block; }
+  body.is-ended .cta { display: none; }
 
   /* ---------- 요약 ---------- */
   .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0 28px; }
@@ -167,15 +158,10 @@
 
   @media (max-width: 760px) {
     .hero { grid-template-columns: 1fr; padding: 22px 18px; }
-    .cta { min-width: 0; flex-direction: row-reverse; align-items: center; gap: 20px; }
-    .cta .btn { flex: 1; }
+    .cta { min-width: 0; }
     .summary { grid-template-columns: repeat(2, 1fr); }
     .search { flex: 1; width: auto; }
     .controls { width: 100%; }
-  }
-  @media (max-width: 520px) {
-    /* 휴대폰에서는 이미 설문을 열 기기이므로 QR 대신 버튼만 */
-    .cta .qr-box { display: none; }
   }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -209,10 +195,9 @@
     </div>
     <div class="cta">
       <div class="qr-box">
-        <div class="qr" id="qr" role="img" aria-label="설문 바로가기 QR 코드"></div>
+        <div class="qr" id="qr" role="img" aria-label="설문으로 가는 QR 코드"></div>
         <div class="qr-caption">휴대폰 카메라로 찍으면 바로 열려요</div>
       </div>
-      <a class="btn" id="goBtn" target="_blank" rel="noopener">설문 바로가기 →</a>
     </div>
   </section>
 
@@ -342,12 +327,9 @@ function setUpdated(ts, isSample) {
 function updateDday() {
   const now = new Date();
   const el = document.getElementById('dday');
-  const btn = document.getElementById('goBtn');
   if (now > DEADLINE) {
     document.body.classList.add('is-ended');
     el.textContent = '설문 종료';
-    btn.setAttribute('aria-disabled', 'true');
-    btn.textContent = '설문이 종료되었어요';
     return;
   }
   const kst = d => new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
@@ -381,7 +363,6 @@ async function load() {
 }
 
 /* ===== 초기화 ===== */
-document.getElementById('goBtn').href = FORM_URL;
 if (window.QRCode) {
   new QRCode(document.getElementById('qr'), { text: FORM_URL, width: 172, height: 172, correctLevel: QRCode.CorrectLevel.M });
 }
