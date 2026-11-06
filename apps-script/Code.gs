@@ -4,6 +4,8 @@
  *
  * 하는 일
  *  1) 응답이 들어올 때마다 학과별 참여 인원을 집계합니다.
+ *     재학생 명부와 학번·학과가 맞고, 그 학번으로 처음 낸 응답만 셉니다.
+ *     명부는 학번을 비밀 키로 해시한 값만 스크립트 속성(ROSTER_*)에 보관합니다. 원래 학번은 저장하지 않습니다.
  *  2) 설문 선택지의 "현재 참여 학생 비율"을 갱신하고, 10%를 채운 학과는 목록에서 뺍니다.
  *     설문 안의 "학과별 실시간 참여 현황" 그래프 이미지도 다시 그립니다.
  *  3) GitHub 대시보드가 읽어 갈 집계 JSON을 웹앱 주소(/exec)로 내보냅니다.
@@ -12,6 +14,7 @@
  * 처음 설정
  *  ① 아래 ENROLLMENT에 학과별 재학생 수를 채웁니다.
  *  ② 편집기에서 setup 함수를 한 번 실행하고 권한을 허용합니다. (응답 트리거 설치 + 첫 집계)
+ *  ②-1 명부 올리기: makeUploadToken 실행 → 로그의 토큰으로 /exec에 POST {token, key, roster} (doPost 참고)
  *  ③ 배포 → 새 배포 → 웹 앱 (실행: 나 / 액세스: 모든 사용자) → /exec 주소를 대시보드 index.html의 API_URL에 넣습니다.
  */
 
@@ -22,6 +25,10 @@ const CONFIG = {
   UPDATE_LABELS: true,          // 선택지 옆 "현재 참여 학생 비율"을 갱신할지
   UPDATE_CHART: true,           // 설문 안의 참여 현황 그래프 이미지를 다시 그릴지
   CHART_TITLE: '학과별 실시간 참여 현황', // 그래프 이미지 항목 제목 (앞부분)
+  ID_TITLE: '0-3. 학번',        // 학번 문항 제목 (앞부분)
+  VERIFY: true,                 // 명부 대조로 통과한 응답만 셀지
+  ID_PATTERN: '^20[0-9]{8}$',   // 설문 학번 형식 검사 (10자리 숫자)
+  TEST_IDS: {},                 // 테스트용 가짜 학번 → 학과 (테스트 끝나면 비워 둘 것)
 };
 
 /** 2026학년도 2학기 재학생 수 (IR 학적현황월별 2026-10-01 기준, 학적상태=재학). 학과명은 선택지 괄호 앞 이름과 같아야 합니다.
@@ -123,11 +130,9 @@ function findDeptItem_(form) {
 
 function computeStats_(form, item) {
   const counts = {};
-  form.getResponses().forEach(r => {
-    const ir = r.getResponseForItem(item);
-    if (!ir) return;
-    const name = deptName_(ir.getResponse());
-    counts[name] = (counts[name] || 0) + 1;
+  verifyAll_(form, item).forEach(v => {
+    if (v.result !== 'ok' || !v.dept) return;
+    counts[v.dept] = (counts[v.dept] || 0) + 1;
   });
   return {
     updatedAt: new Date().toISOString(),
@@ -183,6 +188,151 @@ function updateChart_(form, stats) {
   imageItem.asImageItem().setImage(chart.getAs('image/png'));
 }
 
+/* ───────────── 학번 · 학과 대조 ───────────── */
+
+/** 모든 응답을 제출 순서대로 판정. result: ok | no_id | not_found | dept_mismatch | duplicate */
+function verifyAll_(form, deptItem) {
+  const idItem = findItem_(form, CONFIG.ID_TITLE, [FormApp.ItemType.TEXT]);
+  const key = CONFIG.VERIFY ? rosterKey_() : null;
+  const seen = {};
+  return form.getResponses()
+    .sort((a, b) => a.getTimestamp() - b.getTimestamp())
+    .map(r => {
+      const dr = r.getResponseForItem(deptItem);
+      const ir = r.getResponseForItem(idItem);
+      const dept = dr ? deptName_(dr.getResponse()) : '';
+      const id = ir ? normalizeId_(ir.getResponse()) : '';
+      return { response: r, dept: dept, id: id, result: CONFIG.VERIFY ? checkId_(dept, id, key, seen) : 'ok' };
+    });
+}
+
+function checkId_(dept, id, key, seen) {
+  if (!id) return 'no_id';
+  let expected;
+  if (CONFIG.TEST_IDS[id]) {
+    expected = CONFIG.TEST_IDS[id];
+  } else {
+    const code = roster_()[idHash_(id, key)];
+    if (!code) return 'not_found';
+    expected = code === '*' ? dept : Object.keys(ENROLLMENT)[parseInt(code, 36)]; // '*' = 소속 학과가 따로 없는 학생
+  }
+  if (expected !== dept) return 'dept_mismatch';
+  if (seen[id]) return 'duplicate';
+  seen[id] = true;
+  return 'ok';
+}
+
+/** 명부: 항목마다 [해시 앞 8자리 + 학과 코드 1자리], 학과 코드는 ENROLLMENT 순서(36진수), '*'는 학과 무관 */
+let rosterMap_ = null;
+function roster_() {
+  if (rosterMap_) return rosterMap_;
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const n = Number(props.ROSTER_N || 0);
+  if (!n) throw new Error('명부(ROSTER_*)가 올라가 있지 않습니다.');
+  let all = '';
+  for (let i = 0; i < n; i++) all += props['ROSTER_' + i] || '';
+  const m = {};
+  for (let i = 0; i < all.length; i += 9) m[all.substr(i, 8)] = all.charAt(i + 8);
+  return (rosterMap_ = m);
+}
+
+/** 명부 업로드용 일회용 토큰 발급 (편집기에서 실행 → 로그의 토큰 사용, 한 번 쓰면 사라짐) */
+function makeUploadToken() {
+  const t = Utilities.getUuid();
+  PropertiesService.getScriptProperties().setProperty('UPLOAD_TOKEN', t);
+  Logger.log(t);
+}
+
+/** 명부 업로드 입구. 일회용 토큰이 맞을 때만 키와 명부를 저장하고 바로 집계를 다시 합니다. */
+function doPost(e) {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('UPLOAD_TOKEN');
+  let body = {};
+  try { body = JSON.parse(e.postData.contents); } catch (err) {}
+  const out = o => ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+  if (!token || body.token !== token) return out({ ok: false });
+  props.deleteProperty('UPLOAD_TOKEN');
+  const roster = String(body.roster || '');
+  if (!body.key || !roster || roster.length % 9) return out({ ok: false, error: 'bad payload' });
+  Object.keys(props.getProperties()).filter(k => /^ROSTER_\d+$/.test(k)).forEach(k => props.deleteProperty(k));
+  const CHUNK = 8001; // 9의 배수, 속성 값 한도(9KB) 이내
+  let n = 0;
+  for (let i = 0; i < roster.length; i += CHUNK) props.setProperty('ROSTER_' + n++, roster.substr(i, CHUNK));
+  props.setProperties({ ROSTER_N: String(n), ROSTER_KEY: String(body.key) });
+  rosterMap_ = null;
+  refresh();
+  return out({ ok: true, entries: roster.length / 9 });
+}
+
+function rosterKey_() {
+  const k = PropertiesService.getScriptProperties().getProperty('ROSTER_KEY');
+  if (!k) throw new Error('스크립트 속성 ROSTER_KEY가 없습니다.');
+  return k;
+}
+
+function normalizeId_(v) {
+  return String(v || '').replace(/[^0-9]/g, '');
+}
+
+function idHash_(id, key) {
+  return Utilities.computeHmacSha256Signature(id, key).slice(0, 4)
+    .map(b => ('0' + ((b + 256) % 256).toString(16)).slice(-2)).join('');
+}
+
+function findItem_(form, title, types) {
+  const item = types.reduce((all, t) => all.concat(form.getItems(t)), [])
+    .find(it => it.getTitle().trim().indexOf(title) === 0);
+  if (!item) throw new Error(`'${title}' 문항을 찾지 못했습니다.`);
+  return item;
+}
+
+/** 설문 학번 문항에 10자리 숫자 형식 검사를 건다 (편집기에서 한 번 실행) */
+function applyIdValidation() {
+  const item = findItem_(FormApp.getActiveForm(), CONFIG.ID_TITLE, [FormApp.ItemType.TEXT]).asTextItem();
+  item.setValidation(FormApp.createTextValidation()
+    .requireTextMatchesPattern(CONFIG.ID_PATTERN)
+    .setHelpText('학번 10자리를 숫자로만 입력해 주세요. (예: 2025123456)')
+    .build());
+}
+
+/** 판정 결과를 붙인 응답 전체를 새 스프레드시트로 내보냄 (쿠폰 명단 · 결과 분석용, 편집기에서 실행) */
+function exportVerified() {
+  const form = FormApp.getActiveForm();
+  const deptItem = findDeptItem_(form);
+  const LABEL = { ok: '통과', no_id: '학번 없음', not_found: '명부에 없음', dept_mismatch: '학과 불일치', duplicate: '중복 응답' };
+  const items = form.getItems().filter(it => [FormApp.ItemType.LIST, FormApp.ItemType.MULTIPLE_CHOICE,
+    FormApp.ItemType.CHECKBOX, FormApp.ItemType.TEXT, FormApp.ItemType.PARAGRAPH_TEXT].indexOf(it.getType()) >= 0);
+  const rows = [['판정', '제출 시각'].concat(items.map(it => it.getTitle()))];
+  verifyAll_(form, deptItem).forEach(v => {
+    rows.push([LABEL[v.result], v.response.getTimestamp()].concat(items.map(it => {
+      const ir = v.response.getResponseForItem(it);
+      const a = ir ? ir.getResponse() : '';
+      return Array.isArray(a) ? a.join(', ') : a;
+    })));
+  });
+  const name = '설문 응답 판정 ' + Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd HH:mm');
+  const ss = SpreadsheetApp.create(name);
+  ss.getSheets()[0].getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+  ss.getSheets()[0].setFrozenRows(1);
+  const n = rows.slice(1).filter(r => r[0] === '통과').length;
+  Logger.log(`${name}: 전체 ${rows.length - 1}건, 통과 ${n}건 → ${ss.getUrl()}`);
+}
+
+/** 판정 결과 요약을 로그로 출력 (개인정보 없이 건수만, 편집기에서 실행) */
+function verifySummary() {
+  const form = FormApp.getActiveForm();
+  const list = verifyAll_(form, findDeptItem_(form));
+  const byResult = {}, byDept = {};
+  list.forEach(v => {
+    byResult[v.result] = (byResult[v.result] || 0) + 1;
+    const d = byDept[v.dept] = byDept[v.dept] || { 전체: 0, 통과: 0 };
+    d.전체++; if (v.result === 'ok') d.통과++;
+  });
+  Logger.log('전체 응답 ' + list.length + '건 / 판정별 ' + JSON.stringify(byResult));
+  Logger.log('학과별 ' + JSON.stringify(byDept));
+  Logger.log('테스트 학번 응답 ' + list.filter(v => CONFIG.TEST_IDS[v.id] || /^2099/.test(v.id)).map(v => v.dept + ':' + v.result).join(', '));
+}
+
 function readStats_() {
   const raw = PropertiesService.getScriptProperties().getProperty(STATS_KEY);
   return raw ? JSON.parse(raw) : null;
@@ -199,6 +349,7 @@ const INTRO_TEXT = [
   "· 해당 기자재나 공간을 이용하지 않아 불편이 없었다면 '전혀 없었다'를 골라 주세요.",
   '· 설문 기간: 2026년 11월 15일(일)까지',
   '· 참여 경품: 음료 쿠폰(모바일) — 학과별 재학생의 10%까지 선착순 지급, 수량이 다 차면 해당 학과는 마감됩니다.',
+  '· 학번과 소속 학과가 학적과 일치하는 응답만 참여 인원과 쿠폰 대상으로 인정됩니다. (1인 1회)',
 ].join('\n');
 
 function restoreIntro() {
